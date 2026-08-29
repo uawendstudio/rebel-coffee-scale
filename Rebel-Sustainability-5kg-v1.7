@@ -68,7 +68,7 @@ void setOledBrightness(uint8_t mode);
 inline void resetInactivityTimer() { lastActivityTime = millis(); }
 
 // Time and weight
-const float factoryCalibrationFactor = 432.82001f;
+const float factoryCalibrationFactor = 428.38000f;
 float calibrationFactor = factoryCalibrationFactor;
 float displayWeight = 0.00;
 unsigned long timerStartMillis = 0;
@@ -509,19 +509,25 @@ void loop() {
       resetInactivityTimer();
     }
 
-    if (abs(displayWeight) < 0.75f && diff < 0.15f) {
-      displayWeight = (currentRawGrams * 0.4f) + (displayWeight * 0.96f);
-    } else if (diff < 0.25f) {
-      // Deadband stability locking. Locks the weight if the change is lower than diff
-    } else if (diff < 0.80f) {
-      displayWeight = (currentRawGrams * 0.12f) + (displayWeight * 0.88f);
-    } else {
-      displayWeight = currentRawGrams;
-    }
+   // 2. Tiered Filtering Logic
+if (abs(displayWeight) < 0.75f && diff < 0.15f) {
+  // FIXED: Sum of coefficients equals 1.0 (0.04 + 0.96 = 1.00)
+  displayWeight = (currentRawGrams * 0.04f) + (displayWeight * 0.96f);
+} else if (diff < 0.07f) {
+  // FIXED: Tightened deadband from 0.25g down to 0.07g to prevent trapping negative drift
+} else if (diff < 0.80f) {
+  // Active pour / dynamic change smoothing
+  displayWeight = (currentRawGrams * 0.12f) + (displayWeight * 0.88f);
+} else {
+  // Instant pass-through for large weight changes
+  displayWeight = currentRawGrams;
+}
 
-    if (abs(displayWeight) < 0.1f) {
-      displayWeight = 0.00f;
-    }
+// 3. Asymmetric Zero-Snap & Negative Unload Drain
+// FIXED: Clamps negative hysteresis drift up to -0.45g back to absolute 0.00g
+if (displayWeight > -0.45f && displayWeight < 0.08f) {
+  displayWeight = 0.00f;
+}
 
     if (autoStartEnabled && !timerRunning && displayWeight > 5.0f) {
       timerRunning = true;
