@@ -15,7 +15,6 @@ U8G2_SSD1309_128X64_NONAME0_F_4W_HW_SPI u8g2(U8G2_R2, 17, 16, 20);
 NAU7802 myScale;
 
 
-
 // Hardware base zero offset (set at startup/calibration for overload protection)
 int32_t hardwareZeroOffset = 0;
 
@@ -77,7 +76,7 @@ inline void resetInactivityTimer() { lastActivityTime = millis(); }
 
 
 // Time and weight
-const float factoryCalibrationFactor = 687.8700f;
+const float factoryCalibrationFactor = 674.78003f;
 float calibrationFactor = factoryCalibrationFactor;
 float displayWeight = 0.00;
 unsigned long timerStartMillis = 0;
@@ -269,7 +268,17 @@ void loop() {
 
   // MENU LOGIC
   if (currentState != STATE_SCALE) {
-    if (currentState == STATE_MENU_HOME) {
+    if (currentState == STATE_CAL_DONE) {
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_6x12_tr);
+      u8g2.drawStr(30, 32, "CALIBRATED!");
+      u8g2.sendBuffer();
+
+      delay(1200);
+      currentState = STATE_MENU_HOME;
+      menuEnteredTime = now;
+      u8g2.clearBuffer();
+    } else if (currentState == STATE_MENU_HOME) {
       if (click7) {
         menuIndex = (menuIndex + 1) % 8;
       } else if (click6) {
@@ -400,65 +409,47 @@ void loop() {
         u8g2.clearBuffer();
       }
     } else if (currentState == STATE_CAL_STEP3_MEASURE) {
-      static unsigned long calStepStart = 0;
-      static bool samplingStarted = false;
-
-
-      if (calStepStart == 0) {
-        calStepStart = now;
-        samplingStarted = false;
-      }
-
-
-      if (now - calStepStart >= 1200 && !samplingStarted) {
-        samplingStarted = true;
-        while (myScale.available()) { myScale.getReading(); }
-
-
-        long rawWithWeight = 0;
-        int samplesWeight = 0;
-        unsigned long calTimeout = millis();
-
-
-        while (samplesWeight < 30 && (millis() - calTimeout < 2500)) {
-          if (myScale.available()) {
-            rawWithWeight += myScale.getReading();
-            samplesWeight++;
-          }
-        }
-
-
-        if (samplesWeight > 0) {
-          rawWithWeight /= samplesWeight;
-        }
-
-
-        long rawZero = myScale.getZeroOffset();
-        float newFactor = (float)abs(rawWithWeight - rawZero) / 100.0f;
-
-
-        if (newFactor > 10.0f) {
-          calibrationFactor = newFactor;
-          saveSettings();
-          currentState = STATE_CAL_DONE;
-        } else {
-          currentState = STATE_MENU_HOME;
-        }
-
-
-        calStepStart = 0;
-        menuEnteredTime = now;
-        u8g2.clearBuffer();
-      }
-    } else if (currentState == STATE_CAL_DONE) {
       u8g2.clearBuffer();
       u8g2.setFont(u8g2_font_6x12_tr);
-      u8g2.drawStr(30, 32, "CALIBRATED!");
+      u8g2.drawStr(20, 32, "SAMPLING 100G...");
       u8g2.sendBuffer();
 
+      // 1. Give physical load cell 1 second to stop mechanically vibrating
+      delay(1000);
 
-      delay(1200);
-      currentState = STATE_MENU_HOME;
+      // 2. Clear stale readings from buffer
+      while (myScale.available()) { myScale.getReading(); }
+
+      long rawWithWeight = 0;
+      int samplesWeight = 0;
+      unsigned long calTimeout = millis();
+
+      // 3. Collect 60 samples instead of 30 for better noise reduction
+      while (samplesWeight < 60 && (millis() - calTimeout < 4000)) {
+        if (myScale.available()) {
+          rawWithWeight += myScale.getReading();
+          samplesWeight++;
+        }
+        delay(5);
+      }
+
+      if (samplesWeight > 0) {
+        rawWithWeight /= samplesWeight;
+      }
+
+      long rawZero = myScale.getZeroOffset();
+      
+      // Calculate exact hardware scale factor directly against 100.0g
+      float newFactor = (float)abs(rawWithWeight - rawZero) / 100.0f;
+
+      if (newFactor > 10.0f) {
+        calibrationFactor = newFactor;
+        saveSettings();
+        currentState = STATE_CAL_DONE;
+      } else {
+        currentState = STATE_MENU_HOME;
+      }
+
       menuEnteredTime = now;
       u8g2.clearBuffer();
     }
@@ -561,26 +552,30 @@ void loop() {
 
     float diff = abs(currentRawGrams - displayWeight);
 
-
-    if (timerRunning || diff > 0.50f) {
+    // Auto sleep prevention. If the weight change is lower than 10 g - it will sleep.
+    if (timerRunning || diff > 10.00f) {
       resetInactivityTimer();
     }
 
+   // 2. Tiered Filtering Logic
+if (abs(displayWeight) < 0.75f && diff < 0.15f) {
+  // FIXED: Sum of coefficients equals 1.0 (0.04 + 0.96 = 1.00)
+  displayWeight = (currentRawGrams * 0.04f) + (displayWeight * 0.96f);
+} else if (diff < 0.07f) {
+  // FIXED: Tightened deadband from 0.25g down to 0.07g to prevent trapping negative drift
+} else if (diff < 0.80f) {
+  // Active pour / dynamic change smoothing
+  displayWeight = (currentRawGrams * 0.12f) + (displayWeight * 0.88f);
+} else {
+  // Instant pass-through for large weight changes
+  displayWeight = currentRawGrams;
+}
 
-    if (abs(displayWeight) < 0.40f && diff < 0.25f) {
-      displayWeight = (currentRawGrams * 0.04f) + (displayWeight * 0.96f);
-    } else if (diff < 0.07f) {
-      // Deadband stability locking
-    } else if (diff < 0.60f) {
-      displayWeight = (currentRawGrams * 0.12f) + (displayWeight * 0.88f);
-    } else {
-      displayWeight = currentRawGrams;
-    }
-
-
-    if (abs(displayWeight) < 0.08f) {
-      displayWeight = 0.00f;
-    }
+// 3. Asymmetric Zero-Snap & Negative Unload Drain
+// FIXED: Clamps negative hysteresis drift up to -0.45g back to absolute 0.00g
+if (displayWeight > -0.45f && displayWeight < 0.08f) {
+  displayWeight = 0.00f;
+}
 
 
     if (autoStartEnabled && !timerRunning && displayWeight > 5.0f) {
@@ -674,6 +669,12 @@ void drawUI() {
     u8g2.sendBuffer();
     return;
   } else if (currentState == STATE_CONFIRM_CALIBRATION) {
+    // show calibration factor
+    u8g2.setFont(u8g2_font_squeezed_b6_tr);
+    char calDisplay[32];
+    snprintf(calDisplay, sizeof(calDisplay), "cal factor: %.5f", calibrationFactor);
+    u8g2.drawStr(0, 6, calDisplay);
+
     u8g2.setFont(u8g2_font_6x12_tr);
     u8g2.drawStr(15, 22, "Sure you want to");
     u8g2.drawStr(15, 36, "calibrate?");
@@ -734,13 +735,6 @@ void drawUI() {
 
   // MAIN SCALE DISPLAY
   u8g2.setFont(u8g2_font_squeezed_b6_tr);
-  
-  /* draw calibration factor
-  char bufferForCalibrationDisplay[12]; // Create a character buffer big enough to hold the number
- // Convert float to string with 4 decimal places
-  snprintf(bufferForCalibrationDisplay, sizeof(bufferForCalibrationDisplay), "%.4f", calibrationFactor);
-  u8g2.drawStr(0, 6, bufferForCalibrationDisplay); 
-  */
 
 
   if (timerRunning) {
