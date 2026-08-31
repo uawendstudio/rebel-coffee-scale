@@ -40,24 +40,33 @@ const int buttonPins[3] = { 7, 8, 6 };
 const int BATTERY_PIN = 28;
 
 enum Action { ACTION_TIME = 0,
-              ACTION_AUTO = 1,
-              ACTION_TARE = 2 };
-int userMapping[3] = { 0, 1, 2 };
+                ACTION_AUTO = 1,
+                ACTION_TARE = 2 };
+  int userMapping[3] = { 0, 1, 2 };
 
+enum TareState {
+    TARE_IDLE,
+    TARE_SETTLING,   // Waiting for physical mechanical vibrations to stop
+    TARE_CALCULATING // Sampling NAU7802 scale readings
+  };
+
+  TareState currentTareState = TARE_IDLE;
+  unsigned long tarePhaseStartTime = 0;
+  const unsigned long TARE_SETTLING_DELAY_MS = 250; // Delay before measuring (adjust as needed)
 
 enum ScaleState {
-  STATE_SCALE,
-  STATE_MENU_HOME,
-  STATE_CONFIRM_DEFAULTS,
-  STATE_MAP_TARE,
-  STATE_MAP_AUTO,
-  STATE_MAP_TIME,
-  STATE_CONFIRM_CALIBRATION,
-  STATE_CAL_STEP1_EMPTY,
-  STATE_CAL_STEP2_PLACE_WT,
-  STATE_CAL_STEP3_MEASURE,
-  STATE_CAL_DONE
-};
+    STATE_SCALE,
+    STATE_MENU_HOME,
+    STATE_CONFIRM_DEFAULTS,
+    STATE_MAP_TARE,
+    STATE_MAP_AUTO,
+    STATE_MAP_TIME,
+    STATE_CONFIRM_CALIBRATION,
+    STATE_CAL_STEP1_EMPTY,
+    STATE_CAL_STEP2_PLACE_WT,
+    STATE_CAL_STEP3_MEASURE,
+    STATE_CAL_DONE
+  };
 ScaleState currentState = STATE_SCALE;
 
 
@@ -191,6 +200,12 @@ void loop() {
   bool click7 = false;
   bool click8 = false;
   bool click6 = false;
+
+  if (digitalRead(buttonPins[0]) == LOW || 
+    digitalRead(buttonPins[1]) == LOW || 
+    digitalRead(buttonPins[2]) == LOW) {
+    resetInactivityTimer();
+}
 
 
   for (int i = 0; i < 3; i++) {
@@ -469,31 +484,60 @@ void loop() {
   bool autoActionClick = (userMapping[ACTION_AUTO] == 0 ? click7 : (userMapping[ACTION_AUTO] == 1 ? click8 : click6));
 
 
-  static unsigned long tareDownTime = 0;
-  if (tareActionActive) {
-    if (tareDownTime == 0) tareDownTime = now;
-  } else {
-    if (tareDownTime > 0 && (now - tareDownTime < 800)) {
-      if (tareResetsTimer) {
-        timerRunning = false;
-        autoStartEnabled = false;
-        timerStartMillis = 0;
-      }
 
 
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_6x12_tr);
-      u8g2.drawStr(30, 35, tareResetsTimer ? "RESETTING..." : "TARING...");
-      u8g2.sendBuffer();
+// --- SCALE MODE TARE LOGIC ---
+static unsigned long tareDownTime = 0;
+unsigned long tareStartTime = 0;
 
-
-      delay(150);
-      myScale.calculateZeroOffset(8);
-      displayWeight = 0.00;
+if (tareActionActive) {
+  resetInactivityTimer(); // Prevent sleep while holding tare button
+  if (tareDownTime == 0) tareDownTime = now;
+} else {
+  // Trigger Tare on button release (if held under 800ms)
+  if (tareDownTime > 0 && (now - tareDownTime < 800) && currentTareState == TARE_IDLE) {
+    if (tareResetsTimer) {
+      timerRunning = false;
+      autoStartEnabled = false;
+      timerStartMillis = 0;
     }
-    tareDownTime = 0;
+    
+    resetInactivityTimer();
+    // Phase 1: Begin settling delay state
+    currentTareState = TARE_SETTLING;
+    tarePhaseStartTime = now;
   }
+  tareDownTime = 0;
+}
 
+// Phased non-blocking processing
+switch (currentTareState) {
+  case TARE_SETTLING:
+    // Wait for mechanical bounce/vibrations to clear without stopping loop()
+    if (now - tarePhaseStartTime >= TARE_SETTLING_DELAY_MS) {
+      currentTareState = TARE_CALCULATING;
+    }
+    break;
+
+  case TARE_CALCULATING:
+    // Clear any stale readings in the hardware queue right before reading
+    while (myScale.available()) { 
+      myScale.getReading(); 
+    }
+    
+    // Execute NAU7802 zero offset calculation
+    myScale.calculateZeroOffset(8);
+    displayWeight = 0.00f;
+    
+    // Phase 3: Finish Tare and return to normal scale operation
+    currentTareState = TARE_IDLE;
+    resetInactivityTimer();
+    break;
+
+  case TARE_IDLE:
+  default:
+    break;
+}
 
   if (timeActionClick) {
     if (timerRunning) {
@@ -736,11 +780,22 @@ void drawUI() {
   // MAIN SCALE DISPLAY
   u8g2.setFont(u8g2_font_squeezed_b6_tr);
 
-
   if (timerRunning) {
     u8g2.drawTriangle(0, 1, 0, 13, 9, 7);
   } else if (autoStartEnabled) {
     u8g2.drawStr(0, 6, "Auto start");
+  }
+
+  // Show message while settling or calculating, bypassing standard weight UI
+  if (currentTareState != TARE_IDLE) {
+    u8g2.setFont(u8g2_font_6x12_tr);
+    if (currentTareState == TARE_SETTLING) {
+      u8g2.drawStr(30, 35, "SETTLING...");
+    } else {
+      u8g2.drawStr(30, 35, tareResetsTimer ? "RESETTING..." : "TARING...");
+    }
+    u8g2.sendBuffer();
+    return;
   }
 
 
