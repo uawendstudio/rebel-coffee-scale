@@ -40,19 +40,19 @@ const int buttonPins[3] = { 7, 8, 6 };
 const int BATTERY_PIN = 28;
 
 enum Action { ACTION_TIME = 0,
-                ACTION_AUTO = 1,
-                ACTION_TARE = 2 };
+              ACTION_AUTO = 1,
+              ACTION_TARE = 2 };
   int userMapping[3] = { 0, 1, 2 };
 
 enum TareState {
     TARE_IDLE,
-    TARE_SETTLING,   // Waiting for physical mechanical vibrations to stop
+    TARE_SETTLING,   // Waiting for physical mechanical button vibrations to stop
     TARE_CALCULATING // Sampling NAU7802 scale readings
   };
 
   TareState currentTareState = TARE_IDLE;
   unsigned long tarePhaseStartTime = 0;
-  const unsigned long TARE_SETTLING_DELAY_MS = 250; // Delay before measuring (adjust as needed)
+  const unsigned long TARE_SETTLING_DELAY_MS = 550; // Increased to 350ms to let button press vibrations settle safely
 
 enum ScaleState {
     STATE_SCALE,
@@ -73,7 +73,7 @@ ScaleState currentState = STATE_SCALE;
 int menuIndex = 0;  // List of 8: 0..7
 bool isLbs = false;
 bool isNiMH = false;
-bool tareResetsTimer = true;  // TRUE = RESET (Time+Weight), FALSE = TARE (Weight only)
+bool tareResetsTimer = true;  // TRUE = RESET (Time+Weight+Auto), FALSE = TARE (Weight only)
 
 
 unsigned long lastActivityTime = 0;
@@ -81,6 +81,9 @@ unsigned long lastActivityTime = 0;
 
 void enterDeepSleep();
 void setOledBrightness(uint8_t mode);
+void drawUI();
+void loadSettings();
+void saveSettings();
 inline void resetInactivityTimer() { lastActivityTime = millis(); }
 
 
@@ -140,17 +143,12 @@ const int DISPLAY_INTERVAL = 40;
 unsigned long lastDebounceTime[3] = { 0, 0, 0 };
 bool buttonState[3] = { HIGH, HIGH, HIGH };
 bool lastStableButtonState[3] = { HIGH, HIGH, HIGH };
-const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long DEBOUNCE_DELAY = 40;
 unsigned long menuEnteredTime = 0;
 
 
 const uint8_t contrastValues[6] = { 1, 5, 10, 20, 30, 40 };
 uint8_t contrastIndex = 3;
-
-
-void drawUI();
-void loadSettings();
-void saveSettings();
 
 
 void setup() {
@@ -160,7 +158,7 @@ void setup() {
   Wire.setSDA(12);
   Wire.setSCL(13);
   Wire.begin();
-  Wire.setClock(100000);   // 400kHz Fast I2C but test stability at 10
+  Wire.setClock(100000);   // 100kHz standard I2C stability
   Wire.setTimeout(20000);  // 20ms hardware timeout for I2C operations
   SPI.begin();
 
@@ -179,10 +177,12 @@ void setup() {
   analogReadResolution(12);
 
 
+
+
   if (myScale.begin(Wire)) {
     myScale.setLDO(NAU7802_LDO_3V3);
     myScale.setGain(NAU7802_GAIN_128);
-    myScale.setSampleRate(NAU7802_SPS_20);
+    myScale.setSampleRate(NAU7802_SPS_20); // Kept at 20 SPS as requested
 
 
     myScale.calibrateAFE();
@@ -201,13 +201,6 @@ void loop() {
   bool click8 = false;
   bool click6 = false;
 
-  if (digitalRead(buttonPins[0]) == LOW || 
-    digitalRead(buttonPins[1]) == LOW || 
-    digitalRead(buttonPins[2]) == LOW) {
-    resetInactivityTimer();
-}
-
-
   for (int i = 0; i < 3; i++) {
     bool rawReading = digitalRead(buttonPins[i]);
 
@@ -220,7 +213,8 @@ void loop() {
 
     if ((now - lastDebounceTime[i]) > DEBOUNCE_DELAY) {
       if (rawReading != lastStableButtonState[i]) {
-        if (rawReading == HIGH) {
+        if (rawReading == LOW) { // Action triggered on press down to eliminate release lag
+          resetInactivityTimer();
           if (buttonPins[i] == 7) click7 = true;
           if (buttonPins[i] == 8) click8 = true;
           if (buttonPins[i] == 6) click6 = true;
@@ -231,29 +225,21 @@ void loop() {
   }
 
 
-  if (click7 || click8 || click6) {
-    resetInactivityTimer();
-  }
-
-
   unsigned long currentTimeout = getSleepTimeoutMs();
   if (currentTimeout > 0 && currentState == STATE_SCALE && (now - lastActivityTime >= currentTimeout)) {
     enterDeepSleep();
   }
 
 
-  // Menu access + debounce
+  // Menu access via long press on Pin 6 (button index 2)
   static unsigned long btn6DownTime = 0;
   static bool waitingForRelease6 = false;
-
 
   if (digitalRead(6) == LOW) {
     if (btn6DownTime == 0 && !waitingForRelease6) {
       btn6DownTime = now;
     }
-
-
-    if (currentState == STATE_SCALE && btn6DownTime > 0 && (now - btn6DownTime >= 500)) {
+    if (currentState == STATE_SCALE && btn6DownTime > 0 && (now - btn6DownTime >= 600)) {
       currentState = STATE_MENU_HOME;
       menuIndex = 0;
       waitingForRelease6 = true;
@@ -262,19 +248,11 @@ void loop() {
       u8g2.clearBuffer();
     }
   } else {
-    if (waitingForRelease6) {
-      waitingForRelease6 = false;
-    }
+    waitingForRelease6 = false;
     btn6DownTime = 0;
   }
 
-
-  if (waitingForRelease6) {
-    click6 = false;
-  }
-
-
-  if (currentState != STATE_SCALE && (now - menuEnteredTime < 1000)) {
+  if (currentState != STATE_SCALE && (now - menuEnteredTime < 300)) {
     click6 = false;
     click7 = false;
     click8 = false;
@@ -401,7 +379,7 @@ void loop() {
         if (samplesZero > 0) {
           int32_t zOffset = rawZero / samplesZero;
           myScale.setZeroOffset(zOffset);
-          hardwareZeroOffset = zOffset; // Update hardware reference base on zero calibration
+          hardwareZeroOffset = zOffset;
         }
 
 
@@ -429,17 +407,13 @@ void loop() {
       u8g2.drawStr(20, 32, "SAMPLING 100G...");
       u8g2.sendBuffer();
 
-      // 1. Give physical load cell 1 second to stop mechanically vibrating
       delay(1000);
-
-      // 2. Clear stale readings from buffer
       while (myScale.available()) { myScale.getReading(); }
 
       long rawWithWeight = 0;
       int samplesWeight = 0;
       unsigned long calTimeout = millis();
 
-      // 3. Collect 60 samples instead of 30 for better noise reduction
       while (samplesWeight < 60 && (millis() - calTimeout < 4000)) {
         if (myScale.available()) {
           rawWithWeight += myScale.getReading();
@@ -453,8 +427,6 @@ void loop() {
       }
 
       long rawZero = myScale.getZeroOffset();
-      
-      // Calculate exact hardware scale factor directly against 100.0g
       float newFactor = (float)abs(rawWithWeight - rawZero) / 100.0f;
 
       if (newFactor > 10.0f) {
@@ -478,66 +450,47 @@ void loop() {
   }
 
 
-  // SCALE MODE
-  bool tareActionActive = (digitalRead(buttonPins[userMapping[ACTION_TARE]]) == LOW);
+  // SCALE MODE ACTIONS
+  bool tareActionClick = (userMapping[ACTION_TARE] == 0 ? click7 : (userMapping[ACTION_TARE] == 1 ? click8 : click6));
   bool timeActionClick = (userMapping[ACTION_TIME] == 0 ? click7 : (userMapping[ACTION_TIME] == 1 ? click8 : click6));
   bool autoActionClick = (userMapping[ACTION_AUTO] == 0 ? click7 : (userMapping[ACTION_AUTO] == 1 ? click8 : click6));
 
 
-
-
-// --- SCALE MODE TARE LOGIC ---
-static unsigned long tareDownTime = 0;
-unsigned long tareStartTime = 0;
-
-if (tareActionActive) {
-  resetInactivityTimer(); // Prevent sleep while holding tare button
-  if (tareDownTime == 0) tareDownTime = now;
-} else {
-  // Trigger Tare on button release (if held under 800ms)
-  if (tareDownTime > 0 && (now - tareDownTime < 800) && currentTareState == TARE_IDLE) {
+  // --- SCALE MODE TARE LOGIC (Non-Blocking FSM with Settling Delay) ---
+  if (tareActionClick && currentTareState == TARE_IDLE) {
     if (tareResetsTimer) {
       timerRunning = false;
-      autoStartEnabled = false;
+      autoStartEnabled = false; // Exits auto mode / disarms auto-start completely
       timerStartMillis = 0;
     }
-    
     resetInactivityTimer();
-    // Phase 1: Begin settling delay state
     currentTareState = TARE_SETTLING;
     tarePhaseStartTime = now;
   }
-  tareDownTime = 0;
-}
 
-// Phased non-blocking processing
-switch (currentTareState) {
-  case TARE_SETTLING:
-    // Wait for mechanical bounce/vibrations to clear without stopping loop()
-    if (now - tarePhaseStartTime >= TARE_SETTLING_DELAY_MS) {
-      currentTareState = TARE_CALCULATING;
-    }
-    break;
+  switch (currentTareState) {
+    case TARE_SETTLING:
+      // Wait for physical button push vibrations to settle completely before reading zero
+      if (now - tarePhaseStartTime >= TARE_SETTLING_DELAY_MS) {
+        currentTareState = TARE_CALCULATING;
+      }
+      break;
 
-  case TARE_CALCULATING:
-    // Clear any stale readings in the hardware queue right before reading
-    while (myScale.available()) { 
-      myScale.getReading(); 
-    }
-    
-    // Execute NAU7802 zero offset calculation
-    myScale.calculateZeroOffset(8);
-    displayWeight = 0.00f;
-    
-    // Phase 3: Finish Tare and return to normal scale operation
-    currentTareState = TARE_IDLE;
-    resetInactivityTimer();
-    break;
+    case TARE_CALCULATING:
+      while (myScale.available()) { 
+        myScale.getReading(); 
+      }
+      myScale.calculateZeroOffset(4);
+      displayWeight = 0.00f;
+      currentTareState = TARE_IDLE;
+      resetInactivityTimer();
+      break;
 
-  case TARE_IDLE:
-  default:
-    break;
-}
+    case TARE_IDLE:
+    default:
+      break;
+  }
+
 
   if (timeActionClick) {
     if (timerRunning) {
@@ -552,7 +505,7 @@ switch (currentTareState) {
 
 
   if (autoActionClick) {
-    myScale.calculateZeroOffset(15);
+    myScale.calculateZeroOffset(4);
     displayWeight = 0;
     timerStartMillis = now;
     timerRunning = false;
@@ -560,19 +513,16 @@ switch (currentTareState) {
   }
 
 
-// BATTERY MEASUREMENT (Every 15 seconds)
+  // BATTERY MEASUREMENT (Every 15 seconds)
   unsigned long batteryInterval = 15000; 
   if (now - lastBatteryCheck >= batteryInterval) {
     lastBatteryCheck = now;
-    
     float newSampleV = readStabilizedBatteryVoltage();
 
     if (!batteryInitialized) {
       smoothedBatteryV = newSampleV;
       batteryInitialized = true;
     } else {
-      // Exponential Moving Average (EMA filter)
-      // 85% previous value + 15% new sample prevents sudden screen jumps
       smoothedBatteryV = (smoothedBatteryV * 0.7f) + (newSampleV * 0.3f);
     }
   }
@@ -586,40 +536,27 @@ switch (currentTareState) {
     }
 
 
-    // Absolute load cell mass check relative to true hardware zero
     absoluteWeightGrams = (float)(rawValue - hardwareZeroOffset) / calibrationFactor;
-
-
-    // Relative weight for display (relative to tared zero)
     float currentRawGrams = (float)(rawValue - myScale.getZeroOffset()) / calibrationFactor;
-
-
     float diff = abs(currentRawGrams - displayWeight);
 
-    // Auto sleep prevention. If the weight change is lower than 10 g - it will sleep.
     if (timerRunning || diff > 10.00f) {
       resetInactivityTimer();
     }
 
-   // 2. Tiered Filtering Logic
-if (abs(displayWeight) < 0.75f && diff < 0.15f) {
-  // FIXED: Sum of coefficients equals 1.0 (0.04 + 0.96 = 1.00)
-  displayWeight = (currentRawGrams * 0.04f) + (displayWeight * 0.96f);
-} else if (diff < 0.07f) {
-  // FIXED: Tightened deadband from 0.25g down to 0.07g to prevent trapping negative drift
-} else if (diff < 0.80f) {
-  // Active pour / dynamic change smoothing
-  displayWeight = (currentRawGrams * 0.12f) + (displayWeight * 0.88f);
-} else {
-  // Instant pass-through for large weight changes
-  displayWeight = currentRawGrams;
-}
+    if (abs(displayWeight) < 0.75f && diff < 0.15f) {
+      displayWeight = (currentRawGrams * 0.04f) + (displayWeight * 0.96f);
+    } else if (diff < 0.07f) {
+      // Deadband stability hold
+    } else if (diff < 0.80f) {
+      displayWeight = (currentRawGrams * 0.12f) + (displayWeight * 0.88f);
+    } else {
+      displayWeight = currentRawGrams;
+    }
 
-// 3. Asymmetric Zero-Snap & Negative Unload Drain
-// FIXED: Clamps negative hysteresis drift up to -0.45g back to absolute 0.00g
-if (displayWeight > -0.45f && displayWeight < 0.08f) {
-  displayWeight = 0.00f;
-}
+    if (displayWeight > -0.45f && displayWeight < 0.08f) {
+      displayWeight = 0.00f;
+    }
 
 
     if (autoStartEnabled && !timerRunning && displayWeight > 5.0f) {
@@ -629,7 +566,7 @@ if (displayWeight > -0.45f && displayWeight < 0.08f) {
   }
 
 
-  if (now - lastDisplayUpdate > DISPLAY_INTERVAL) {
+  if (now - lastDisplayUpdate >= DISPLAY_INTERVAL) {
     lastDisplayUpdate = now;
     drawUI();
   }
@@ -713,7 +650,6 @@ void drawUI() {
     u8g2.sendBuffer();
     return;
   } else if (currentState == STATE_CONFIRM_CALIBRATION) {
-    // show calibration factor
     u8g2.setFont(u8g2_font_squeezed_b6_tr);
     char calDisplay[32];
     snprintf(calDisplay, sizeof(calDisplay), "cal factor: %.5f", calibrationFactor);
@@ -773,10 +709,6 @@ void drawUI() {
   }
 
 
-
-
-
-
   // MAIN SCALE DISPLAY
   u8g2.setFont(u8g2_font_squeezed_b6_tr);
 
@@ -784,18 +716,6 @@ void drawUI() {
     u8g2.drawTriangle(0, 1, 0, 13, 9, 7);
   } else if (autoStartEnabled) {
     u8g2.drawStr(0, 6, "Auto start");
-  }
-
-  // Show message while settling or calculating, bypassing standard weight UI
-  if (currentTareState != TARE_IDLE) {
-    u8g2.setFont(u8g2_font_6x12_tr);
-    if (currentTareState == TARE_SETTLING) {
-      u8g2.drawStr(30, 35, "SETTLING...");
-    } else {
-      u8g2.drawStr(30, 35, tareResetsTimer ? "RESETTING..." : "TARING...");
-    }
-    u8g2.sendBuffer();
-    return;
   }
 
 
@@ -859,13 +779,19 @@ void drawUI() {
   bool isOverload = (absoluteWeightGrams > 4500.0f);
 
 
-  if (isOverload) {
+  // Handle transient text overlay during Tare states smoothly within the main refresh loop
+  if (currentTareState != TARE_IDLE) {
+    u8g2.setFont(u8g2_font_6x12_tr);
+    if (currentTareState == TARE_SETTLING) {
+      u8g2.drawStr(30, 35, tareResetsTimer ? "RESETTING..." : "TARING...");
+    } 
+    
+  } else if (isOverload) {
     u8g2.setFont(u8g2_font_helvB12_tr);
     const char* heavyStr = "TOO HEAVY";
     int hWidth = u8g2.getStrWidth(heavyStr);
     u8g2.drawStr((128 - hWidth) / 2, mainY - 2, heavyStr);
   } else {
-    // Render Timer / Warning
     if (isWarning) {
       u8g2.setFont(u8g2_font_7x14_tr);
       u8g2.drawStr(0, mainY - 2, "WARNING!");
@@ -882,7 +808,6 @@ void drawUI() {
     }
 
 
-    // Render Weight
     float calcWeight = isLbs ? (displayWeight * 0.00220462f) : displayWeight;
 
 
@@ -969,32 +894,32 @@ void enterDeepSleep() {
 
 void setOledBrightness(uint8_t mode) {
   switch (mode) {
-    case 0: // Level 1 (Ultra Dim)
+    case 0:
       u8g2.sendF("ca", 0xD9, 0x11);
       u8g2.sendF("ca", 0xDB, 0x00);
       u8g2.setContrast(0);
       break;
-    case 1: // Level 5 (Dim)
+    case 1:
       u8g2.sendF("ca", 0xD9, 0x22);
       u8g2.sendF("ca", 0xDB, 0x10);
       u8g2.setContrast(5);
       break;
-    case 2: // Level 10 (Low)
+    case 2:
       u8g2.sendF("ca", 0xD9, 0x22);
       u8g2.sendF("ca", 0xDB, 0x20);
       u8g2.setContrast(15);
       break;
-    case 3: // Level 20 (Medium)
+    case 3:
       u8g2.sendF("ca", 0xD9, 0x44);
       u8g2.sendF("ca", 0xDB, 0x30);
       u8g2.setContrast(40);
       break;
-    case 4: // Level 30 (High)
+    case 4:
       u8g2.sendF("ca", 0xD9, 0x82);
       u8g2.sendF("ca", 0xDB, 0x34);
       u8g2.setContrast(120);
       break;
-    case 5: // Level 40 (Bright)
+    case 5:
       u8g2.sendF("ca", 0xD9, 0xF1);
       u8g2.sendF("ca", 0xDB, 0x34);
       u8g2.setContrast(255);
