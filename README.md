@@ -6,6 +6,12 @@ Batteries will be charged by using a separate charger.
 Key feature - proper auto-stopwatch. And predictable stopwatch which is easy to reset (push - counting - push - reset).
 Physical turn off / on switch to not deal with the sensors and to not wait for them to turn off.
 
+V2.7 firmware v2.3
+- Scroll up when holding scroll in menu
+- Entering menu without taring
+- Measuring - jittery, smoother 
+- Added firmware version
+- Additional Language (cyrillic)
 
 v2.5 firmware v1.7
 - More brightness options
